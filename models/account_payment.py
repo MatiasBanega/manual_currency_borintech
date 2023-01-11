@@ -1,54 +1,38 @@
 # -*- coding: utf-8 -*-
-##############################################################################
-#
-#    This module uses OpenERP, Open Source Management Solution Framework.
-#    Copyright (C) 2017-Today Sitaram
-#
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU General Public License as published by
-#    the Free Software Foundation, either version 3 of the License, or
-#    (at your option) any later version.
-#
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    GNU General Public License for more details.
-#
-#    You should have received a copy of the GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>
-#
-##############################################################################
 
-from odoo import models, fields, api, _
+from odoo import fields, models,api, _
 
 
-class AccountPayments(models.Model):
-    _inherit = 'account.payment'
+class account_payment(models.Model):
+    _inherit ='account.payment'
 
-    apply_manual_currency_exchange = fields.Boolean(string='Apply Manual Currency Exchange')
-    manual_currency_exchange_rate = fields.Float(string='Manual Currency Exchange Rate')
-    active_manual_currency_rate = fields.Boolean('active Manual Currency', default=False)
+    manual_currency_rate_active = fields.Boolean('Apply Manual Exchange')
+    manual_currency_rate = fields.Float('Rate', digits=(12, 6))
 
-
-    @api.onchange('currency_id')
-    def onchange_currency_id(self):
-        if self.currency_id:
-            if self.company_id.currency_id != self.currency_id:
-                self.active_manual_currency_rate = True
-            else:
-                self.active_manual_currency_rate = False
-        else:
-            self.active_manual_currency_rate = False
-            
     @api.model
-    def default_get(self, fields):
-        result = super(AccountPayments, self).default_get(fields)
-        move_id = self.env['account.move'].browse(self._context.get('active_ids')).filtered(lambda move: move.is_invoice(include_receipts=True))
-        result.update({
-            'apply_manual_currency_exchange':move_id.apply_manual_currency_exchange,
-            'manual_currency_exchange_rate':move_id.manual_currency_exchange_rate
-            })
-        return result
+    def default_get(self, default_fields):
+        rec = super(account_payment, self).default_get(default_fields)
+        active_ids = self._context.get('active_ids') or self._context.get('active_id')
+        active_model = self._context.get('active_model')
+
+        # Check for selected invoices ids
+        if not active_ids or active_model != 'account.move':
+            return rec
+        invoices = self.env['account.move'].browse(active_ids).filtered(lambda move: move.is_invoice(include_receipts=True))
+        for inv in invoices:
+            manual_currency_rate_active = inv.manual_currency_rate_active
+            manual_currency_rate = inv.manual_currency_rate
+
+        if self.manual_currency_rate_active and self.manual_currency_rate:
+            manual_currency_rate_active = self.manual_currency_rate_active
+            manual_currency_rate = self.manual_currency_rate
+
+        rec.update({
+            'manual_currency_rate_active': manual_currency_rate_active,
+            'manual_currency_rate': manual_currency_rate
+        })
+        return rec
+
 
     @api.model
     def _compute_payment_amount(self, invoices, currency, journal, date):
@@ -88,17 +72,25 @@ class AccountPayments(models.Model):
         query_res = self._cr.dictfetchall()
 
         total = 0.0
-        for res in query_res:
-            move_currency = self.env['res.currency'].browse(res['currency_id'])
-            if move_currency == currency and move_currency != company.currency_id:
-                total += res['residual_currency']
-            else:
-                company = company.with_context(
-                manual_rate=self.manual_currency_exchange_rate,
-                active_manutal_currency = self.apply_manual_currency_exchange,
-            )
-                total += company.currency_id._convert(res['amount_residual'], currency, company, date)
+        for inv in invoices:
+            for res in query_res:
+                move_currency = self.env['res.currency'].browse(res['currency_id'])
+                if move_currency == currency and move_currency != company.currency_id:
+                    total += res['residual_currency']
+                else:
+                    if not inv.manual_currency_rate_active:
+                        total += company.currency_id._convert(res['amount_residual'], currency, company, date)
+                    else:
+                        total += res['residual_currency'] * inv.manual_currency_rate
         return total
+
+    @api.depends('invoice_ids', 'amount', 'payment_date', 'currency_id', 'payment_type', 'manual_currency_rate')
+    def _compute_payment_difference(self):
+        draft_payments = self.filtered(lambda p: p.invoice_ids and p.state == 'draft')
+        for pay in draft_payments:
+            payment_amount = -pay.amount if pay.payment_type == 'outbound' else pay.amount
+            pay.payment_difference = pay._compute_payment_amount(pay.invoice_ids, pay.currency_id, pay.journal_id, pay.payment_date) - payment_amount
+        (self - draft_payments).payment_difference = 0
 
 
     def _prepare_payment_moves(self):
@@ -137,7 +129,6 @@ class AccountPayments(models.Model):
             else:
                 counterpart_amount = -payment.amount
                 liquidity_line_account = payment.journal_id.default_credit_account_id
-
             # Manage currency.
             if payment.currency_id == company_currency:
                 # Single-currency.
@@ -147,32 +138,25 @@ class AccountPayments(models.Model):
                 currency_id = False
             else:
                 # Multi-currencies.
-#                 payment = payment.with_context(
-#                 manual_rate=self.manual_currency_exchange_rate,
-#                 active_manutal_currency = self.apply_manual_currency_exchange,
-#             )
-                if self.active_manual_currency_rate:
-                    if self.apply_manual_currency_exchange:
-                        balance = counterpart_amount / payment.manual_currency_exchange_rate
-                        write_off_balance = write_off_amount / payment.manual_currency_exchange_rate
-                    else:
-                        balance = payment.currency_id._convert(counterpart_amount, company_currency, payment.company_id, payment.payment_date)
-                        write_off_balance = payment.currency_id._convert(write_off_amount, company_currency, payment.company_id, payment.payment_date)
+                if payment.manual_currency_rate_active:
+                    balance = counterpart_amount / payment.manual_currency_rate
+                    write_off_balance = write_off_amount / payment.manual_currency_rate
+                    currency_id = payment.currency_id.id
                 else:
                     balance = payment.currency_id._convert(counterpart_amount, company_currency, payment.company_id, payment.payment_date)
                     write_off_balance = payment.currency_id._convert(write_off_amount, company_currency, payment.company_id, payment.payment_date)
-                currency_id = payment.currency_id.id
+                    currency_id = payment.currency_id.id
 
             # Manage custom currency on journal for liquidity line.
             if payment.journal_id.currency_id and payment.currency_id != payment.journal_id.currency_id:
                 # Custom currency on journal.
+                liquidity_line_currency_id = payment.journal_id.currency_id.id
                 liquidity_amount = company_currency._convert(
                     balance, payment.journal_id.currency_id, payment.company_id, payment.payment_date)
             else:
                 # Use the payment currency.
                 liquidity_line_currency_id = currency_id
                 liquidity_amount = counterpart_amount
-
             # Compute 'name' to be used in receivable/payable line.
             rec_pay_line_name = ''
             if payment.payment_type == 'transfer':
@@ -197,9 +181,12 @@ class AccountPayments(models.Model):
             else:
                 liquidity_line_name = payment.name
 
+            # ==== 'inbound' / 'outbound' ====
             move_vals = {
                 'date': payment.payment_date,
                 'ref': payment.communication,
+                'manual_currency_rate' :payment.manual_currency_rate,
+                'manual_currency_rate_active':payment.manual_currency_rate_active,
                 'journal_id': payment.journal_id.id,
                 'currency_id': payment.journal_id.currency_id.id or payment.company_id.currency_id.id,
                 'partner_id': payment.partner_id.id,
@@ -243,25 +230,25 @@ class AccountPayments(models.Model):
                     'account_id': payment.writeoff_account_id.id,
                     'payment_id': payment.id,
                 }))
+
             if move_names:
                 move_vals['name'] = move_names[0]
 
             all_move_vals.append(move_vals)
 
+            # ==== 'transfer' ====
             if payment.payment_type == 'transfer':
 
                 if payment.destination_journal_id.currency_id:
-                    if self.active_manual_currency_rate:
-                        if self.apply_manual_currency_exchange:
-                            transfer_amount = counterpart_amount / payment.manual_currency_exchange_rate
-                        else:
-                            transfer_amount = payment.currency_id._convert(counterpart_amount, payment.destination_journal_id.currency_id, payment.company_id, payment.payment_date)
+                    transfer_amount = payment.currency_id._convert(counterpart_amount, payment.destination_journal_id.currency_id, payment.company_id, payment.payment_date)
                 else:
                     transfer_amount = 0.0
 
                 transfer_move_vals = {
                     'date': payment.payment_date,
                     'ref': payment.communication,
+                    'manual_currency_rate' :payment.manual_currency_rate,
+                    'manual_currency_rate_active':payment.manual_currency_rate_active,                    
                     'partner_id': payment.partner_id.id,
                     'journal_id': payment.destination_journal_id.id,
                     'line_ids': [
@@ -290,10 +277,13 @@ class AccountPayments(models.Model):
                             'payment_id': payment.id,
                         }),
                     ],
-                }
+                }            
 
                 if move_names and len(move_names) == 2:
                     transfer_move_vals['name'] = move_names[1]
 
                 all_move_vals.append(transfer_move_vals)
-        return all_move_vals
+
+        return all_move_vals   
+
+# vim:expandtab:smartindent:tabstop=4:softtabstop=4:shiftwidth=4:
